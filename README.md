@@ -16,14 +16,6 @@ Super Search allows you to:
 
 ---
 
-## ⚙️ Requirements
-
-- `find`
-- `stat`
-- `numfmt`
-
----
-
 ## 🚀 Usage
 
 Make the script executable:
