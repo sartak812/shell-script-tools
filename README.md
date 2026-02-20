@@ -1,8 +1,7 @@
-# shell-script-tools
+# Super Search 🔍
 
 <img src="example.jpg" width="600">
 
-# Super Search 🔍
 
 A simple Bash script to find the largest file in a directory.
 
