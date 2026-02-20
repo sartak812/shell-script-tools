@@ -1,5 +1,6 @@
 # shell-script-tools
 Shell scripts for automation
+<img src="example.jpg" width="600">
 
 # Super Search 🔍
 
