@@ -2,4 +2,4 @@
 # ---------------------------------------------------
 # BDG Corp Server Monitoring Script
 # ---------------------------------------------------
-echo "System Check:"
+echo "System Check: $(df / | awk 'NR==2 {print 100-$5 "%"}')"
