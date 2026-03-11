@@ -1,3 +1,5 @@
+![UI Dashboard](Screenshots/UI%20Dashboard.jpg)
+
 # Crypto Pulse API
 
 Crypto Pulse is a small Flask startup-style API that fetches live crypto prices, (parse the incoming JSON, extract at least 3 specific pieces of data, add some custom logic , like filtering or calculating something new), and return your own clean, customized JSON dictionary to the user from CoinGecko (Bitcoin, Ethereum, Litecoin), calculates simple metrics (average,
