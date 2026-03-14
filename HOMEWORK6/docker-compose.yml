@@ -1,0 +1,18 @@
+version: "3.9"
+
+services:
+  crypto-api:
+    build: .
+    container_name: crypto-pulse-api
+    ports:
+      - "5000:5000"
+    environment:
+      # SQLite file is stored in mounted /app/data volume.
+      DATABASE_PATH: /app/data/crypto.db
+      APP_ENV: docker
+    volumes:
+      - sqlite_data:/app/data
+    restart: unless-stopped
+
+volumes:
+  sqlite_data:

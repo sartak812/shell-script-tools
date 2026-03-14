@@ -1,12 +1,14 @@
 ## Import OS utilities to read and set environment variables.
 import os
+import sqlite3
 # Import Path helper for safe file path operations.
 from pathlib import Path
+from datetime import datetime, timezone
 
 # Import HTTP client library for upstream API requests.
 import requests
 # Import Flask primitives used by this application.
-from flask import Flask, jsonify, redirect, render_template_string, url_for
+from flask import Flask, jsonify, redirect, render_template_string, request, url_for
 
 
 # Define helper function that loads key/value pairs from a .env file.
@@ -45,6 +47,85 @@ app = Flask(__name__)
 APP_ENV = os.getenv("APP_ENV")
 # Read API_KEY variable for potential authenticated upstream calls.
 API_KEY = os.getenv("API_KEY")
+# Read database path from environment for flexible local/docker setup.
+DATABASE_PATH = os.getenv("DATABASE_PATH", "data/crypto.db")
+
+
+# Define helper that opens a new SQLite connection per request or action.
+def get_db_connection():
+    # Create parent directory for DB file when it does not exist yet.
+    Path(DATABASE_PATH).parent.mkdir(parents=True, exist_ok=True)
+    # Open sqlite database file configured by DATABASE_PATH.
+    conn = sqlite3.connect(DATABASE_PATH)
+    # Allow dictionary-style column access (row["column_name"]).
+    conn.row_factory = sqlite3.Row
+    # Return open connection to caller.
+    return conn
+
+
+# Define one-time DB bootstrap that creates required table.
+def init_db():
+    # Open connection for schema initialization.
+    conn = get_db_connection()
+    # Wrap writes in try/finally so connection always closes.
+    try:
+        # Create table for saved crypto snapshots if it does not exist.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS crypto_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bitcoin_usd REAL NOT NULL,
+                ethereum_usd REAL NOT NULL,
+                litecoin_usd REAL NOT NULL,
+                average_usd REAL NOT NULL,
+                spread_usd REAL NOT NULL,
+                highest TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'manual',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        # Persist schema creation to disk.
+        conn.commit()
+    finally:
+        # Close connection regardless of success or failure.
+        conn.close()
+
+
+# Define helper that computes derived metrics from 3 coin prices.
+def build_metrics(btc_usd, eth_usd, ltc_usd):
+    # Compute BTC minus ETH spread rounded to two decimals.
+    spread = round(btc_usd - eth_usd, 2)
+    # Compute average price across selected coins rounded to two decimals.
+    avg_price = round((btc_usd + eth_usd + ltc_usd) / 3, 2)
+    # Build temporary map coin->price to detect highest coin.
+    price_map = {"bitcoin": btc_usd, "ethereum": eth_usd, "litecoin": ltc_usd}
+    # Pick coin name that has the highest USD value.
+    max_coin = max(price_map, key=price_map.get)
+    # Return all computed values in one dictionary.
+    return {"spread_usd": spread, "average_usd": avg_price, "highest": max_coin}
+
+
+# Define helper that normalizes a DB row into API JSON structure.
+def row_to_result(row):
+    # Return plain dict that can be serialized by jsonify.
+    return {
+        "id": row["id"],
+        "prices": {
+            "bitcoin_usd": row["bitcoin_usd"],
+            "ethereum_usd": row["ethereum_usd"],
+            "litecoin_usd": row["litecoin_usd"],
+        },
+        "spread_usd": row["spread_usd"],
+        "average_usd": row["average_usd"],
+        "highest": row["highest"],
+        "source": row["source"],
+        "created_at": row["created_at"],
+    }
+
+
+# Initialize the sqlite schema at startup so routes can use DB immediately.
+init_db()
 
 
 # Register route for root URL.
@@ -451,17 +532,8 @@ def crypto():
             502,
         )
 
-    # Compute BTC minus ETH spread rounded to two decimals.
-    spread = round(btc_usd - eth_usd, 2)
-    # Compute average price across selected coins rounded to two decimals.
-    avg_price = round((btc_usd + eth_usd + ltc_usd) / 3, 2)
-    # Determine which coin currently has the highest USD price.
-    max_coin = max(
-        # Build temporary map coin->price.
-        {"bitcoin": btc_usd, "ethereum": eth_usd, "litecoin": ltc_usd},
-        # Use map value as comparison key for max selection.
-        key=lambda k: {"bitcoin": btc_usd, "ethereum": eth_usd, "litecoin": ltc_usd}[k],
-    )
+    # Compute spread, average, and highest coin via shared helper.
+    metrics = build_metrics(btc_usd, eth_usd, ltc_usd)
 
     # Return normalized JSON payload consumed by the front-end dashboard.
     return jsonify(
@@ -475,12 +547,158 @@ def crypto():
             "litecoin_usd": ltc_usd,
         },
         # Include computed spread metric.
-        spread_usd=spread,
+        spread_usd=metrics["spread_usd"],
         # Include computed average metric.
-        average_usd=avg_price,
+        average_usd=metrics["average_usd"],
         # Include coin name with highest USD value.
-        highest=max_coin,
+        highest=metrics["highest"],
     )
+
+
+# Register route that stores user-provided crypto prices in SQLite.
+@app.post("/api/v1/crypto/results")
+# Define endpoint that accepts JSON and persists one snapshot row.
+def create_crypto_result():
+    # Parse request body as JSON safely.
+    payload = request.get_json(silent=True) or {}
+    # Validate required fields one by one for clearer user errors.
+    required_fields = ["bitcoin_usd", "ethereum_usd", "litecoin_usd"]
+    missing = [field for field in required_fields if field not in payload]
+    # Return 400 when required fields are missing from payload.
+    if missing:
+        return (
+            jsonify(
+                error="Invalid payload",
+                message=f"Missing required fields: {', '.join(missing)}",
+            ),
+            400,
+        )
+
+    # Convert incoming values to float so DB always stores numeric data.
+    try:
+        btc_usd = float(payload["bitcoin_usd"])
+        eth_usd = float(payload["ethereum_usd"])
+        ltc_usd = float(payload["litecoin_usd"])
+    except (TypeError, ValueError):
+        # Reject non-numeric values to keep metrics consistent.
+        return (
+            jsonify(
+                error="Invalid payload",
+                message="bitcoin_usd, ethereum_usd, and litecoin_usd must be numbers.",
+            ),
+            400,
+        )
+
+    # Compute derived metrics from the provided three prices.
+    metrics = build_metrics(btc_usd, eth_usd, ltc_usd)
+    # Read optional source label from payload for traceability.
+    source = str(payload.get("source", "manual"))[:50]
+    # Create UTC timestamp string for DB row.
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    # Open DB connection for INSERT operation.
+    conn = get_db_connection()
+    # Ensure connection closes even if SQL fails.
+    try:
+        # Insert one snapshot row and receive assigned id.
+        cursor = conn.execute(
+            """
+            INSERT INTO crypto_results (
+                bitcoin_usd,
+                ethereum_usd,
+                litecoin_usd,
+                average_usd,
+                spread_usd,
+                highest,
+                source,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                btc_usd,
+                eth_usd,
+                ltc_usd,
+                metrics["average_usd"],
+                metrics["spread_usd"],
+                metrics["highest"],
+                source,
+                created_at,
+            ),
+        )
+        # Persist insert transaction.
+        conn.commit()
+        # Read generated row id from insert cursor.
+        created_id = cursor.lastrowid
+    finally:
+        # Close DB connection.
+        conn.close()
+
+    # Return inserted row summary to client.
+    return (
+        jsonify(
+            id=created_id,
+            prices={
+                "bitcoin_usd": btc_usd,
+                "ethereum_usd": eth_usd,
+                "litecoin_usd": ltc_usd,
+            },
+            spread_usd=metrics["spread_usd"],
+            average_usd=metrics["average_usd"],
+            highest=metrics["highest"],
+            source=source,
+            created_at=created_at,
+        ),
+        201,
+    )
+
+
+# Register route that returns previously saved crypto snapshots.
+@app.get("/api/v1/crypto/results")
+# Define endpoint that reads rows from sqlite and returns JSON list.
+def list_crypto_results():
+    # Read optional result limit from query params.
+    raw_limit = request.args.get("limit", "20")
+    # Validate and clamp the limit to avoid returning huge payloads.
+    try:
+        limit = max(1, min(int(raw_limit), 100))
+    except ValueError:
+        return (
+            jsonify(error="Invalid query", message="limit must be an integer."),
+            400,
+        )
+
+    # Open DB connection for SELECT operation.
+    conn = get_db_connection()
+    # Ensure connection closes after query.
+    try:
+        # Query latest rows first so newest snapshots appear on top.
+        rows = conn.execute(
+            """
+            SELECT
+                id,
+                bitcoin_usd,
+                ethereum_usd,
+                litecoin_usd,
+                average_usd,
+                spread_usd,
+                highest,
+                source,
+                created_at
+            FROM crypto_results
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    finally:
+        # Close DB connection.
+        conn.close()
+
+    # Convert sqlite rows into JSON-serializable dictionaries.
+    results = [row_to_result(row) for row in rows]
+    # Return list and count metadata.
+    return jsonify(count=len(results), items=results)
 
 
 # Check whether this module is being run directly.
